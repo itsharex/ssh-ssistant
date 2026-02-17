@@ -928,7 +928,10 @@ pub async fn search_remote_files(
             let sender = sender.clone();
             execute_ssh_operation(move || {
                 let (tx, rx) = std::sync::mpsc::channel();
-                let cmd = format!("find '{}' -name '*{}*'", path, query);
+                // Escape single quotes in path and query to prevent command injection
+                let escaped_path = path.replace('\'', "'\\''");
+                let escaped_query = query.replace('\'', "'\\''");
+                let cmd = format!("find '{}' -name '*{}*'", escaped_path, escaped_query);
 
                 sender
                     .send(SshCommand::Exec {

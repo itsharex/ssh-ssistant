@@ -11,7 +11,47 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::collections::HashMap;
 use tauri::AppHandle;
+
+/// 心跳检测结果缓存，避免频繁检测同一会话
+struct HealthCheckCache {
+    results: HashMap<usize, (bool, Instant)>,
+    cache_duration: Duration,
+}
+
+impl HealthCheckCache {
+    fn new() -> Self {
+        Self {
+            results: HashMap::new(),
+            cache_duration: Duration::from_secs(5),
+        }
+    }
+
+    fn get(&self, key: usize) -> Option<bool> {
+        if let Some((result, timestamp)) = self.results.get(&key) {
+            if timestamp.elapsed() < self.cache_duration {
+                return Some(*result);
+            }
+        }
+        None
+    }
+
+    fn insert(&mut self, key: usize, result: bool) {
+        self.results.insert(key, (result, Instant::now()));
+    }
+
+    fn invalidate(&mut self, key: usize) {
+        self.results.remove(&key);
+    }
+
+    fn cleanup_expired(&mut self) {
+        let now = Instant::now();
+        self.results.retain(|_, (_, timestamp)| {
+            now.duration_since(*timestamp) < self.cache_duration
+        });
+    }
+}
 
 pub struct ForwardingThreadHandle {
     thread_handle: std::thread::JoinHandle<()>,
@@ -78,6 +118,8 @@ pub struct SessionSshPool {
     max_background_sessions: usize,           // 最大后台会话数量
     next_bg_index: Arc<Mutex<usize>>,         // 轮询索引
     created_at: Arc<Mutex<Instant>>,          // 主会话建立时间，用于延迟后台连接
+    health_cache: Arc<Mutex<HealthCheckCache>>, // 心跳检测结果缓存
+    connection_stagger_count: Arc<Mutex<u32>>, // 连接交错计数器，用于指数退避
 }
 
 impl SessionSshPool {
@@ -96,6 +138,8 @@ impl SessionSshPool {
             max_background_sessions,
             next_bg_index: Arc::new(Mutex::new(0)),
             created_at: Arc::new(Mutex::new(Instant::now())),
+            health_cache: Arc::new(Mutex::new(HealthCheckCache::new())),
+            connection_stagger_count: Arc::new(Mutex::new(0)),
         })
     }
 
