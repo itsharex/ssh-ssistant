@@ -8,15 +8,17 @@ use std::time::Duration;
 use tauri::AppHandle;
 
 // Helper to retry ssh2 operations that might return EAGAIN/WouldBlock
+// Maximum of 3 retries to prevent infinite loops on persistent errors
 pub fn ssh2_retry<F, T>(mut f: F) -> Result<T, ssh2::Error>
 where
     F: FnMut() -> Result<T, ssh2::Error>,
 {
-    loop {
+    const MAX_RETRIES: u32 = 3;
+    for attempt in 0..=MAX_RETRIES {
         match f() {
             Ok(v) => return Ok(v),
             Err(e) => {
-                if e.code() == ssh2::ErrorCode::Session(-37) {
+                if e.code() == ssh2::ErrorCode::Session(-37) && attempt < MAX_RETRIES {
                     thread::sleep(Duration::from_millis(10));
                     continue;
                 }
@@ -24,6 +26,7 @@ where
             }
         }
     }
+    unreachable!("Loop always returns")
 }
 
 // 异步执行SSH操作，避免阻塞主线程

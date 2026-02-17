@@ -163,7 +163,7 @@ impl SessionSshPool {
     pub fn get_background_session(&self) -> Result<Arc<Mutex<ManagedSession>>, String> {
         let mut sessions = self.background_sessions.lock().map_err(|e| e.to_string())?;
 
-        // 1. 尝试寻找当前没有被其它线程锁定的“空闲”会话
+        // 1. 尝试寻找当前没有被其它线程锁定的"空闲"会话
         for session in sessions.iter() {
             if let Ok(_guard) = session.try_lock() {
                 // 能够立即拿到锁，说明它是空闲的
@@ -173,14 +173,24 @@ impl SessionSshPool {
 
         // 2. 如果没有空闲会话，且还没达到上限，则创建一个新会话
         if sessions.len() < self.max_background_sessions {
-            // Stagger new connections to avoid flooding the server
+            // 使用指数退避策略替代固定延迟
             if !sessions.is_empty() {
-                thread::sleep(Duration::from_millis(100));
+                let mut count = self.connection_stagger_count.lock().map_err(|e| e.to_string())?;
+                let delay_ms = 10_u64.saturating_pow((*count).min(5)); // 指数退避：10ms, 100ms, 1s, 10s
+                *count = count.saturating_add(1);
+                drop(count);
+                thread::sleep(Duration::from_millis(delay_ms));
             }
 
             let new_session = establish_connection_with_retry(&self.config)?;
             let session_arc = Arc::new(Mutex::new(new_session));
             sessions.push(session_arc.clone());
+
+            // 重置计数器
+            if let Ok(mut count) = self.connection_stagger_count.lock() {
+                *count = 0;
+            }
+
             return Ok(session_arc);
         }
 
