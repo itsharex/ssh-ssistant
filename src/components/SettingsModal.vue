@@ -19,7 +19,12 @@ const form = ref({
   ai: { ...store.ai },
   terminalAppearance: { ...store.terminalAppearance },
   fileManager: { ...store.fileManager },
-  sshPool: { ...store.sshPool }
+  sshPool: { ...store.sshPool },
+  connectionTimeout: { ...store.connectionTimeout },
+  reconnect: { ...store.reconnect },
+  heartbeat: { ...store.heartbeat },
+  poolHealth: { ...store.poolHealth },
+  networkAdaptive: { ...store.networkAdaptive }
 });
 
 // SSH Key Management State
@@ -47,7 +52,12 @@ watch(() => props.show, (val) => {
       ai: { ...store.ai },
       terminalAppearance: { ...store.terminalAppearance },
       fileManager: { ...store.fileManager },
-      sshPool: { ...store.sshPool }
+      sshPool: { ...store.sshPool },
+      connectionTimeout: { ...store.connectionTimeout },
+      reconnect: { ...store.reconnect },
+      heartbeat: { ...store.heartbeat },
+      poolHealth: { ...store.poolHealth },
+      networkAdaptive: { ...store.networkAdaptive }
     };
     sshKeyStore.loadKeys();
     showAddKeyForm.value = false;
@@ -113,8 +123,9 @@ const tabs = [
   { id: 'ai', label: 'settings.aiAssistant' },
   { id: 'terminal', label: 'settings.terminalAppearance' },
   { id: 'fileManager', label: 'settings.fileManagement' },
+  { id: 'connection', label: 'Connection' },
   { id: 'sshPool', label: 'settings.sshPool' },
-  { id: 'sshKeys', label: 'SSH Keys' }, // TODO: Add i18n
+  { id: 'sshKeys', label: 'SSH Keys' },
 ];
 
 </script>
@@ -273,6 +284,204 @@ const tabs = [
                   <input v-model.number="form.fileManager.sftpBufferSize" type="number" min="64" max="1024" step="64"
                     class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
                   <p class="text-xs text-gray-400 mt-1">Buffer size for SFTP file transfers (64KB-1024KB, step 64KB)</p>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <!-- Connection Tab -->
+          <div v-if="activeTab === 'connection'" class="space-y-6">
+            <section>
+              <h3 class="text-lg font-semibold text-white mb-4">Connection Timeout Settings</h3>
+              <div class="space-y-4">
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">Connection Timeout (seconds)</label>
+                  <input v-model.number="form.connectionTimeout.connectionTimeoutSecs" type="number" min="5" max="120"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">Timeout for establishing SSH connections (default: 15s)</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">Jump Host Timeout (seconds)</label>
+                  <input v-model.number="form.connectionTimeout.jumpHostTimeoutSecs" type="number" min="10" max="120"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">Timeout for connecting to jump host (default: 30s)</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">Local Forward Timeout (seconds)</label>
+                  <input v-model.number="form.connectionTimeout.localForwardTimeoutSecs" type="number" min="5" max="60"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">Timeout for local port forwarding (default: 10s)</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">Command Timeout (seconds)</label>
+                  <input v-model.number="form.connectionTimeout.commandTimeoutSecs" type="number" min="10" max="300"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">Timeout for executing remote commands (default: 30s)</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">SFTP Operation Timeout (seconds)</label>
+                  <input v-model.number="form.connectionTimeout.sftpOperationTimeoutSecs" type="number" min="30" max="600"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">Timeout for SFTP file operations (default: 60s)</p>
+                </div>
+              </div>
+            </section>
+
+            <section>
+              <h3 class="text-lg font-semibold text-white mb-4">Smart Reconnection Settings</h3>
+              <div class="space-y-4">
+                <div class="flex items-center">
+                  <input v-model="form.reconnect.enableAutoReconnect" type="checkbox"
+                    class="bg-gray-700 border-gray-600 rounded text-blue-600 focus:ring-blue-500 focus:ring-offset-gray-800 focus:ring-offset-0" />
+                  <span class="ml-2 text-sm text-gray-300">Enable Auto Reconnect with Exponential Backoff</span>
+                </div>
+                <p class="text-xs text-gray-400">
+                  When enabled, failed connections will be retried with increasing delays. Permanent errors (auth failures) will not be retried.
+                </p>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">Max Reconnect Attempts</label>
+                  <input v-model.number="form.reconnect.maxReconnectAttempts" type="number" min="1" max="10"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">Maximum number of reconnection attempts (default: 5)</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">Initial Delay (ms)</label>
+                  <input v-model.number="form.reconnect.initialDelayMs" type="number" min="500" max="5000" step="100"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">Initial delay before first retry (default: 1000ms)</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">Max Delay (ms)</label>
+                  <input v-model.number="form.reconnect.maxDelayMs" type="number" min="5000" max="60000" step="1000"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">Maximum delay between retries (default: 30000ms)</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">Backoff Multiplier</label>
+                  <input v-model.number="form.reconnect.backoffMultiplier" type="number" min="1.5" max="3.0" step="0.1"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">
+                    Delay multiplier for exponential backoff: delay = min(initial * multiplier^attempt, maxDelay) (default: 2.0)
+                  </p>
+                </div>
+              </div>
+            </section>
+
+            <section>
+              <h3 class="text-lg font-semibold text-white mb-4">Heartbeat Settings</h3>
+              <div class="space-y-4">
+                <p class="text-xs text-gray-400">
+                  Layered heartbeat detection: TCP (fastest) -> SSH (medium) -> Application (most reliable).
+                  The system progressively checks connection health and takes action based on failure count.
+                </p>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">TCP Keepalive Interval (seconds)</label>
+                  <input v-model.number="form.heartbeat.tcpKeepaliveIntervalSecs" type="number" min="30" max="300"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">TCP-level keepalive interval (default: 60s)</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">SSH Keepalive Interval (seconds)</label>
+                  <input v-model.number="form.heartbeat.sshKeepaliveIntervalSecs" type="number" min="5" max="60"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">SSH-level keepalive packet interval (default: 15s)</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">App Heartbeat Interval (seconds)</label>
+                  <input v-model.number="form.heartbeat.appHeartbeatIntervalSecs" type="number" min="10" max="120"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">Application-level heartbeat by executing 'echo' command (default: 30s)</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">Heartbeat Timeout (seconds)</label>
+                  <input v-model.number="form.heartbeat.heartbeatTimeoutSecs" type="number" min="2" max="30"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">Timeout for each heartbeat check (default: 5s)</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">Failed Heartbeats Before Action</label>
+                  <input v-model.number="form.heartbeat.failedHeartbeatsBeforeAction" type="number" min="1" max="10"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">
+                    Number of consecutive failures before triggering reconnection (default: 3).
+                    Action progression: SendKeepalive -> BackgroundReconnect -> NotifyUser -> ForceReconnect
+                  </p>
+                </div>
+              </div>
+            </section>
+
+            <section>
+              <h3 class="text-lg font-semibold text-white mb-4">Pool Health Check Settings</h3>
+              <div class="space-y-4">
+                <p class="text-xs text-gray-400">
+                  Connection pool health monitoring: periodic health checks, session warmup, and automatic rebuild of unhealthy sessions.
+                  Sessions are scored based on age, failure count, and idle time.
+                </p>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">Health Check Interval (seconds)</label>
+                  <input v-model.number="form.poolHealth.healthCheckIntervalSecs" type="number" min="30" max="300"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">Interval between pool health checks (default: 60s)</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">Session Warmup Count</label>
+                  <input v-model.number="form.poolHealth.sessionWarmupCount" type="number" min="0" max="5"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">Number of pre-warmed background sessions (default: 1)</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">Max Session Age (minutes)</label>
+                  <input v-model.number="form.poolHealth.maxSessionAgeMinutes" type="number" min="10" max="480"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">Maximum session lifetime before forced rotation (default: 60 min)</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">Unhealthy Threshold</label>
+                  <input v-model.number="form.poolHealth.unhealthyThreshold" type="number" min="1" max="10"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">
+                    Consecutive failures before marking session as unhealthy (default: 3).
+                    Unhealthy sessions will be automatically rebuilt.
+                  </p>
+                </div>
+              </div>
+            </section>
+
+            <section>
+              <h3 class="text-lg font-semibold text-white mb-4">Network Adaptive Settings</h3>
+              <div class="space-y-4">
+                <p class="text-xs text-gray-400">
+                  Adaptive network optimization: automatically adjusts heartbeat interval, SFTP buffer size, and command timeout based on network conditions.
+                </p>
+                <div class="flex items-center">
+                  <input v-model="form.networkAdaptive.enableAdaptive" type="checkbox"
+                    class="bg-gray-700 border-gray-600 rounded text-blue-600 focus:ring-blue-500 focus:ring-offset-gray-800 focus:ring-offset-0" />
+                  <span class="ml-2 text-sm text-gray-300">Enable Network Adaptive Mode</span>
+                </div>
+                <p class="text-xs text-gray-400">
+                  When enabled, the system will automatically measure network latency and adjust parameters:
+                  <br/>- Excellent (&lt;50ms): Heartbeat 10s, SFTP Buffer 1MB, Timeout 60s
+                  <br/>- Good (50-150ms): Heartbeat 15s, SFTP Buffer 512KB, Timeout 30s
+                  <br/>- Fair (150-300ms): Heartbeat 20s, SFTP Buffer 256KB, Timeout 45s
+                  <br/>- Poor (&gt;300ms): Heartbeat 30s, SFTP Buffer 64KB, Timeout 120s
+                </p>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">Latency Check Interval (seconds)</label>
+                  <input v-model.number="form.networkAdaptive.latencyCheckIntervalSecs" type="number" min="10" max="120"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">Interval for measuring network latency (default: 30s)</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">High Latency Threshold (ms)</label>
+                  <input v-model.number="form.networkAdaptive.highLatencyThresholdMs" type="number" min="100" max="1000"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">Latency threshold to consider as high latency (default: 300ms)</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">Low Bandwidth Threshold (KB/s)</label>
+                  <input v-model.number="form.networkAdaptive.lowBandwidthThresholdKbps" type="number" min="10" max="500"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:border-blue-500 outline-none" />
+                  <p class="text-xs text-gray-400 mt-1">Bandwidth threshold to consider as low bandwidth (default: 100 KB/s)</p>
                 </div>
               </div>
             </section>

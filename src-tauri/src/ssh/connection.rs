@@ -1,7 +1,8 @@
-use crate::models::Connection as SshConnConfig;
+use crate::models::{Connection as SshConnConfig, ConnectionTimeoutSettings, ReconnectSettings};
 use crate::ssh::{
-    ssh2_retry, CONNECTION_RETRY_BASE_DELAY, CONNECTION_RETRY_MAX_ATTEMPTS,
-    DEFAULT_CONNECTION_TIMEOUT, JUMP_HOST_TIMEOUT, LOCAL_FORWARD_TIMEOUT,
+    ssh2_retry, SshErrorClassifier, SshErrorType, ReconnectManager,
+    get_connection_timeout, get_jump_host_timeout, get_local_forward_timeout,
+    HealthAction, PoolHealthChecker, PoolHealthReport, SessionHealth, SessionHealthMetadata,
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use ssh2::Session;
@@ -63,6 +64,8 @@ pub struct ManagedSession {
     pub jump_session: Option<Session>,
     pub forward_listener: Option<TcpListener>,
     pub forwarding_handle: Option<ForwardingThreadHandle>,
+    /// Health metadata for tracking session health
+    pub health_metadata: SessionHealthMetadata,
 }
 
 impl Drop for ManagedSession {
@@ -120,12 +123,23 @@ pub struct SessionSshPool {
     created_at: Arc<Mutex<Instant>>,          // 主会话建立时间，用于延迟后台连接
     health_cache: Arc<Mutex<HealthCheckCache>>, // 心跳检测结果缓存
     connection_stagger_count: Arc<Mutex<u32>>, // 连接交错计数器，用于指数退避
+    timeout_settings: Option<ConnectionTimeoutSettings>, // 超时设置
+    reconnect_settings: Option<ReconnectSettings>,       // 重连设置
 }
 
 impl SessionSshPool {
-    pub fn new(config: SshConnConfig, max_background_sessions: usize) -> Result<Self, String> {
+    pub fn new(config: SshConnConfig, max_background_sessions: usize, timeout_settings: Option<ConnectionTimeoutSettings>) -> Result<Self, String> {
+        Self::with_reconnect_settings(config, max_background_sessions, timeout_settings, None)
+    }
+
+    pub fn with_reconnect_settings(
+        config: SshConnConfig,
+        max_background_sessions: usize,
+        timeout_settings: Option<ConnectionTimeoutSettings>,
+        reconnect_settings: Option<ReconnectSettings>,
+    ) -> Result<Self, String> {
         // 创建主会话
-        let main_session = establish_connection_with_retry(&config)?;
+        let main_session = establish_connection_with_retry(&config, timeout_settings.as_ref(), reconnect_settings.as_ref())?;
 
         // Don't create background session immediately to save resources and avoid rate limits
         // It will be created on demand when get_background_session is called
@@ -140,6 +154,8 @@ impl SessionSshPool {
             created_at: Arc::new(Mutex::new(Instant::now())),
             health_cache: Arc::new(Mutex::new(HealthCheckCache::new())),
             connection_stagger_count: Arc::new(Mutex::new(0)),
+            timeout_settings,
+            reconnect_settings,
         })
     }
 
@@ -152,7 +168,7 @@ impl SessionSshPool {
         }
 
         // Establish new
-        let new_session = establish_connection_with_retry(&self.config)?;
+        let new_session = establish_connection_with_retry(&self.config, self.timeout_settings.as_ref(), self.reconnect_settings.as_ref())?;
         let shared_session = Arc::new(Mutex::new(new_session));
         *session_opt = Some(shared_session.clone());
 
@@ -163,7 +179,7 @@ impl SessionSshPool {
     pub fn get_background_session(&self) -> Result<Arc<Mutex<ManagedSession>>, String> {
         let mut sessions = self.background_sessions.lock().map_err(|e| e.to_string())?;
 
-        // 1. 尝试寻找当前没有被其它线程锁定的"空闲"会话
+        // 1. 尝试寻找当前没有被其它线程锁定的”空闲”会话
         for session in sessions.iter() {
             if let Ok(_guard) = session.try_lock() {
                 // 能够立即拿到锁，说明它是空闲的
@@ -182,7 +198,7 @@ impl SessionSshPool {
                 thread::sleep(Duration::from_millis(delay_ms));
             }
 
-            let new_session = establish_connection_with_retry(&self.config)?;
+            let new_session = establish_connection_with_retry(&self.config, self.timeout_settings.as_ref(), self.reconnect_settings.as_ref())?;
             let session_arc = Arc::new(Mutex::new(new_session));
             sessions.push(session_arc.clone());
 
@@ -222,7 +238,7 @@ impl SessionSshPool {
 
             // 确保至少有一个后台会话
             if sessions.is_empty() {
-                if let Ok(new_session) = establish_connection_with_retry(&self.config) {
+                if let Ok(new_session) = establish_connection_with_retry(&self.config, self.timeout_settings.as_ref(), self.reconnect_settings.as_ref()) {
                     sessions.push(Arc::new(Mutex::new(new_session)));
                 }
             }
@@ -435,7 +451,7 @@ impl SessionSshPool {
 
     fn rebuild_main(&self) -> Result<(), String> {
         // 在锁之外建立连接，避免阻塞其他持有锁的操作
-        let new_session = establish_connection_with_retry(&self.config)?;
+        let new_session = establish_connection_with_retry(&self.config, self.timeout_settings.as_ref(), self.reconnect_settings.as_ref())?;
 
         {
             let mut main_sess = self.main_session.lock().map_err(|e| e.to_string())?;
@@ -492,33 +508,222 @@ impl SessionSshPool {
 
         Ok(())
     }
+
+    /// 执行健康检查并生成报告
+    pub fn perform_health_check(&self, checker: &PoolHealthChecker) -> PoolHealthReport {
+        // Collect main session metadata
+        let main_metadata = if let Ok(main_sess) = self.main_session.lock() {
+            main_sess.health_metadata.clone()
+        } else {
+            SessionHealthMetadata::new()
+        };
+
+        // Collect background sessions metadata
+        let background_metadata: Vec<SessionHealthMetadata> = if let Ok(sessions) = self.background_sessions.lock() {
+            sessions
+                .iter()
+                .filter_map(|s| s.lock().ok().map(|sess| sess.health_metadata.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Collect AI session metadata
+        let ai_metadata = if let Ok(ai_opt) = self.ai_session.lock() {
+            ai_opt.as_ref().and_then(|s| s.lock().ok().map(|sess| sess.health_metadata.clone()))
+        } else {
+            None
+        };
+
+        checker.generate_report_from_metadata(&main_metadata, &background_metadata, ai_metadata.as_ref())
+    }
+
+    /// 预热备用会话
+    pub fn warmup_sessions(&self, count: usize) -> Result<(), String> {
+        let mut sessions = self.background_sessions.lock().map_err(|e| e.to_string())?;
+
+        let current_count = sessions.len();
+        let needed = count.saturating_sub(current_count);
+
+        for i in 0..needed {
+            if sessions.len() >= self.max_background_sessions {
+                break;
+            }
+            // Stagger new connections to avoid flooding the server
+            if i > 0 {
+                thread::sleep(Duration::from_millis(100));
+            }
+
+            match establish_connection_with_retry(&self.config, self.timeout_settings.as_ref(), self.reconnect_settings.as_ref()) {
+                Ok(new_session) => {
+                    sessions.push(Arc::new(Mutex::new(new_session)));
+                }
+                Err(e) => {
+                    eprintln!("Failed to warmup session {}: {}", i, e);
+                    // Continue trying to create other sessions
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 重建不健康会话
+    pub fn rebuild_unhealthy(&self, report: &PoolHealthReport) -> Result<(), String> {
+        for action in &report.recommended_actions {
+            match action {
+                HealthAction::RebuildMain => {
+                    self.rebuild_main()?;
+                }
+                HealthAction::RebuildBackground(idx) => {
+                    self.rebuild_background_session(*idx)?;
+                }
+                HealthAction::RebuildAi => {
+                    self.rebuild_ai_session()?;
+                }
+                HealthAction::WarmupSessions(count) => {
+                    self.warmup_sessions(*count)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 更新会话使用时间（应在每次使用会话后调用）
+    pub fn update_session_usage(&self) {
+        // Update main session
+        if let Ok(mut main_sess) = self.main_session.lock() {
+            main_sess.health_metadata.mark_used();
+        }
+
+        // Note: Background sessions are updated when they are actually used
+        // This method is primarily for the main session
+    }
+
+    /// 记录主会话健康检查成功
+    pub fn record_health_success(&self) {
+        if let Ok(mut main_sess) = self.main_session.lock() {
+            main_sess.health_metadata.record_success();
+        }
+    }
+
+    /// 记录主会话健康检查失败
+    pub fn record_health_failure(&self) {
+        if let Ok(mut main_sess) = self.main_session.lock() {
+            main_sess.health_metadata.record_failure();
+        }
+    }
+
+    /// 重建特定索引的后台会话
+    fn rebuild_background_session(&self, idx: usize) -> Result<(), String> {
+        let mut sessions = self.background_sessions.lock().map_err(|e| e.to_string())?;
+
+        if idx < sessions.len() {
+            // Remove the unhealthy session
+            sessions.remove(idx);
+
+            // Create a new session if we're below the limit
+            if sessions.len() < self.max_background_sessions {
+                match establish_connection_with_retry(&self.config, self.timeout_settings.as_ref(), self.reconnect_settings.as_ref()) {
+                    Ok(new_session) => {
+                        sessions.push(Arc::new(Mutex::new(new_session)));
+                    }
+                    Err(e) => {
+                        return Err(format!("Failed to rebuild background session {}: {}", idx, e));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 重建AI会话
+    fn rebuild_ai_session(&self) -> Result<(), String> {
+        let mut ai_opt = self.ai_session.lock().map_err(|e| e.to_string())?;
+
+        // Clear the existing session
+        *ai_opt = None;
+
+        // The session will be recreated on next get_ai_session() call
+
+        Ok(())
+    }
+
+    /// 获取主会话的健康状态
+    pub fn get_main_session_health(&self) -> SessionHealth {
+        if let Ok(main_sess) = self.main_session.lock() {
+            let checker = PoolHealthChecker::with_defaults();
+            checker.check_session_health(&main_sess.health_metadata)
+        } else {
+            SessionHealth::Unhealthy
+        }
+    }
 }
 
-pub fn establish_connection_with_retry(config: &SshConnConfig) -> Result<ManagedSession, String> {
-    for attempt in 1..=CONNECTION_RETRY_MAX_ATTEMPTS {
-        match establish_connection_internal(config) {
-            Ok(session) => return Ok(session),
+pub fn establish_connection_with_retry(
+    config: &SshConnConfig,
+    timeout_settings: Option<&ConnectionTimeoutSettings>,
+    reconnect_settings: Option<&ReconnectSettings>,
+) -> Result<ManagedSession, String> {
+    // Create reconnect manager with settings or defaults
+    let settings = reconnect_settings.cloned().unwrap_or_default();
+    let mut reconnect_manager = ReconnectManager::new(settings);
+
+    loop {
+        match establish_connection_internal(config, timeout_settings) {
+            Ok(session) => {
+                // Connection successful - reset and return
+                reconnect_manager.reset();
+                return Ok(session);
+            }
             Err(e) => {
-                if attempt == CONNECTION_RETRY_MAX_ATTEMPTS {
+                // Classify the error
+                let error_type = SshErrorClassifier::classify_from_string(&e);
+                reconnect_manager.record_attempt(error_type);
+
+                // Check if we should retry
+                if !reconnect_manager.should_retry() {
+                    let error_desc = if error_type == SshErrorType::Permanent {
+                        "Permanent error - will not retry"
+                    } else {
+                        "Max retry attempts reached"
+                    };
                     return Err(format!(
-                        "Failed to establish connection after {} attempts: {}",
-                        CONNECTION_RETRY_MAX_ATTEMPTS, e
+                        "{}: {} (attempts: {})",
+                        error_desc, e, reconnect_manager.attempt_count()
                     ));
                 }
 
-                let delay = CONNECTION_RETRY_BASE_DELAY * 2_u32.pow(attempt - 1);
-                thread::sleep(delay);
+                // Calculate and wait for delay
+                if let Some(delay) = reconnect_manager.calculate_delay() {
+                    println!(
+                        "Connection attempt {} failed: {}. Retrying in {:?}...",
+                        reconnect_manager.attempt_count(),
+                        e,
+                        delay
+                    );
+                    thread::sleep(delay);
+                } else {
+                    return Err(format!(
+                        "Failed to establish connection after {} attempts: {}",
+                        reconnect_manager.attempt_count(), e
+                    ));
+                }
             }
         }
     }
-    unreachable!()
 }
 
-fn establish_connection_internal(config: &SshConnConfig) -> Result<ManagedSession, String> {
+fn establish_connection_internal(config: &SshConnConfig, timeout_settings: Option<&ConnectionTimeoutSettings>) -> Result<ManagedSession, String> {
     let mut sess = Session::new().map_err(|e| e.to_string())?;
     let mut jump_session_holder = None;
     let mut listener_holder = None;
     let mut forwarding_handle = None;
+
+    let connection_timeout = get_connection_timeout(timeout_settings);
+    let jump_host_timeout = get_jump_host_timeout(timeout_settings);
+    let local_forward_timeout = get_local_forward_timeout(timeout_settings);
 
     if let Some(jump_host) = &config.jump_host {
         if !jump_host.trim().is_empty() {
@@ -527,7 +732,7 @@ fn establish_connection_internal(config: &SshConnConfig) -> Result<ManagedSessio
             let jump_addr = format!("{}:{}", jump_host, jump_port);
 
             // Connect to jump host with longer timeout
-            let jump_tcp = connect_with_timeout(&jump_addr, JUMP_HOST_TIMEOUT)
+            let jump_tcp = connect_with_timeout(&jump_addr, jump_host_timeout)
                 .map_err(|e| format!("Jump host connection failed: {}", e))?;
 
             let mut jump_sess = Session::new().map_err(|e| e.to_string())?;
@@ -678,7 +883,7 @@ fn establish_connection_internal(config: &SshConnConfig) -> Result<ManagedSessio
             // 3. Connect to the local forwarded port
             let connect_addr = format!("127.0.0.1:{}", local_port);
             let tcp_stream =
-                connect_with_timeout(&connect_addr, LOCAL_FORWARD_TIMEOUT).map_err(|e| {
+                connect_with_timeout(&connect_addr, local_forward_timeout).map_err(|e| {
                     format!(
                         "Failed to connect to local forwarded port {}: {}",
                         local_port, e
@@ -694,14 +899,14 @@ fn establish_connection_internal(config: &SshConnConfig) -> Result<ManagedSessio
         } else {
             // Direct connection
             let addr_str = format!("{}:{}", config.host, config.port);
-            let tcp = connect_with_timeout(&addr_str, DEFAULT_CONNECTION_TIMEOUT)
+            let tcp = connect_with_timeout(&addr_str, connection_timeout)
                 .map_err(|e| format!("Connection failed: {}", e))?;
             sess.set_tcp_stream(tcp);
         }
     } else {
         // Direct connection
         let addr_str = format!("{}:{}", config.host, config.port);
-        let tcp = connect_with_timeout(&addr_str, DEFAULT_CONNECTION_TIMEOUT)
+        let tcp = connect_with_timeout(&addr_str, connection_timeout)
             .map_err(|e| format!("Connection failed: {}", e))?;
         sess.set_tcp_stream(tcp);
     };
@@ -811,6 +1016,7 @@ fn establish_connection_internal(config: &SshConnConfig) -> Result<ManagedSessio
         jump_session: jump_session_holder,
         forward_listener: listener_holder,
         forwarding_handle,
+        health_metadata: SessionHealthMetadata::new(),
     })
 }
 
@@ -1015,7 +1221,7 @@ pub async fn install_ssh_key(
 
     // Establish temporary connection
     let session_pool = tokio::task::spawn_blocking(move || {
-        crate::ssh::connection::establish_connection_with_retry(&install_config)
+        crate::ssh::connection::establish_connection_with_retry(&install_config, None, None)
     })
     .await
     .map_err(|e| e.to_string())??;

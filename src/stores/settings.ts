@@ -27,6 +27,39 @@ export const useSettingsStore = defineStore('settings', {
       maxBackgroundSessions: 3,
       enableAutoCleanup: true,
       cleanupIntervalMinutes: 5
+    },
+    connectionTimeout: {
+      connectionTimeoutSecs: 15,
+      jumpHostTimeoutSecs: 30,
+      localForwardTimeoutSecs: 10,
+      commandTimeoutSecs: 30,
+      sftpOperationTimeoutSecs: 60
+    },
+    reconnect: {
+      maxReconnectAttempts: 5,
+      initialDelayMs: 1000,
+      maxDelayMs: 30000,
+      backoffMultiplier: 2.0,
+      enableAutoReconnect: true
+    },
+    heartbeat: {
+      tcpKeepaliveIntervalSecs: 60,
+      sshKeepaliveIntervalSecs: 15,
+      appHeartbeatIntervalSecs: 30,
+      heartbeatTimeoutSecs: 5,
+      failedHeartbeatsBeforeAction: 3
+    },
+    poolHealth: {
+      healthCheckIntervalSecs: 60,
+      sessionWarmupCount: 1,
+      maxSessionAgeMinutes: 60,
+      unhealthyThreshold: 3
+    },
+    networkAdaptive: {
+      enableAdaptive: true,
+      latencyCheckIntervalSecs: 30,
+      highLatencyThresholdMs: 300,
+      lowBandwidthThresholdKbps: 100
     }
   }),
   actions: {

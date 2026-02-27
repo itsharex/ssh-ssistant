@@ -1,12 +1,14 @@
 import { defineStore } from 'pinia';
 import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useNotificationStore } from './notifications';
-import type { Session, Connection } from '../types';
+import type { Session, Connection, ConnectionStatusEvent, ReconnectEvent } from '../types';
 
 export const useSessionStore = defineStore('sessions', {
   state: () => ({
     sessions: [] as Session[],
     activeSessionId: null as string | null,
+    _unlistenFns: [] as UnlistenFn[],
   }),
   getters: {
     activeSession: (state) => state.sessions.find(s => s.id === state.activeSessionId),
@@ -219,6 +221,66 @@ export const useSessionStore = defineStore('sessions', {
       const session = this.activeSession;
       if (session) {
         session.activeTab = tab;
+      }
+    },
+
+    // Setup event listeners for connection status updates
+    async setupEventListeners() {
+      // Listen for connection status changes
+      const unlistenStatus = await listen<ConnectionStatusEvent>('connection:status', (event) => {
+        const { sessionId, status } = event.payload;
+        console.log('Connection status event received:', sessionId, status);
+
+        // Map the detailed status to simplified session status
+        const sessionStatus = this.mapConnectionStatusToSessionStatus(status);
+        this.updateSessionStatus(sessionId, sessionStatus);
+      });
+
+      // Listen for connection errors
+      const unlistenError = await listen<ConnectionStatusEvent>('connection:error', (event) => {
+        const { sessionId, details } = event.payload;
+        console.error('Connection error event received:', sessionId, details);
+        this.updateSessionStatus(sessionId, 'disconnected');
+        useNotificationStore().error(`Connection error: ${details || 'Unknown error'}`);
+      });
+
+      // Listen for reconnection attempts
+      const unlistenReconnect = await listen<ReconnectEvent>('connection:reconnect', (event) => {
+        const { sessionId, attempt, maxAttempts, delayMs } = event.payload;
+        console.log('Reconnection attempt:', sessionId, attempt, maxAttempts);
+        this.updateSessionStatus(sessionId, 'connecting');
+        useNotificationStore().info(
+          `Reconnecting... Attempt ${attempt}/${maxAttempts} (${delayMs}ms delay)`
+        );
+      });
+
+      // Store unlisten functions for cleanup
+      this._unlistenFns = [unlistenStatus, unlistenError, unlistenReconnect];
+    },
+
+    // Cleanup event listeners
+    cleanupEventListeners() {
+      this._unlistenFns.forEach((unlisten) => unlisten());
+      this._unlistenFns = [];
+    },
+
+    // Map detailed connection status to simplified session status
+    mapConnectionStatusToSessionStatus(
+      status: 'connecting' | 'connected' | 'authenticating' | 'ready' | 'degraded' | 'reconnecting' | 'disconnected' | 'error'
+    ): 'connected' | 'disconnected' | 'connecting' {
+      switch (status) {
+        case 'connecting':
+        case 'authenticating':
+        case 'reconnecting':
+          return 'connecting';
+        case 'connected':
+        case 'ready':
+        case 'degraded':
+          return 'connected';
+        case 'disconnected':
+        case 'error':
+        default:
+          return 'disconnected';
       }
     }
   }

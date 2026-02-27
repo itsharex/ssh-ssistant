@@ -1,6 +1,8 @@
 use super::connection::{ManagedSession, SessionSshPool};
+use super::heartbeat::{HeartbeatAction, HeartbeatManager, HeartbeatResult};
+use super::network_monitor::NetworkMonitor;
 use super::ShellMsg;
-use crate::models::FileEntry;
+use crate::models::{FileEntry, HeartbeatSettings, NetworkAdaptiveSettings};
 
 use std::io::{ErrorKind, Read, Write};
 use std::path::Path;
@@ -110,6 +112,12 @@ pub struct SshManager {
     // Active Channels
     shell_channel: Option<ssh2::Channel>,
     shell_sender: Option<Sender<ShellMsg>>,
+
+    // Heartbeat Manager
+    heartbeat_manager: HeartbeatManager,
+
+    // Network Monitor
+    network_monitor: NetworkMonitor,
 }
 
 impl SshManager {
@@ -119,6 +127,27 @@ impl SshManager {
         receiver: Receiver<SshCommand>,
         shutdown_signal: Arc<AtomicBool>,
     ) -> Self {
+        Self::with_heartbeat_settings(
+            session,
+            pool,
+            receiver,
+            shutdown_signal,
+            HeartbeatSettings::default(),
+        )
+    }
+
+    pub fn with_heartbeat_settings(
+        session: ManagedSession,
+        pool: SessionSshPool,
+        receiver: Receiver<SshCommand>,
+        shutdown_signal: Arc<AtomicBool>,
+        heartbeat_settings: HeartbeatSettings,
+    ) -> Self {
+        let heartbeat_manager = HeartbeatManager::with_shutdown(
+            heartbeat_settings,
+            shutdown_signal.clone(),
+        );
+        let network_monitor = NetworkMonitor::with_default_settings();
         Self {
             session,
             pool,
@@ -126,13 +155,32 @@ impl SshManager {
             shutdown_signal,
             shell_channel: None,
             shell_sender: None,
+            heartbeat_manager,
+            network_monitor,
         }
     }
 
-    pub fn run(&mut self) {
-        let mut last_keepalive = Instant::now();
-        let keepalive_interval = Duration::from_secs(10);
+    /// Update heartbeat settings at runtime
+    pub fn update_heartbeat_settings(&mut self, settings: HeartbeatSettings) {
+        self.heartbeat_manager.update_settings(settings);
+    }
 
+    /// Update network adaptive settings at runtime
+    pub fn update_network_adaptive_settings(&mut self, settings: NetworkAdaptiveSettings) {
+        self.network_monitor.update_settings(settings);
+    }
+
+    /// Get current network status
+    pub fn get_network_status(&self) -> &crate::models::NetworkStatus {
+        self.network_monitor.get_status()
+    }
+
+    /// Get recommended adaptive parameters
+    pub fn get_adaptive_params(&self) -> crate::models::AdaptiveParams {
+        self.network_monitor.get_recommended_params()
+    }
+
+    pub fn run(&mut self) {
         loop {
             // 1. Check for shutdown
             if self.shutdown_signal.load(Ordering::Relaxed) {
@@ -197,16 +245,93 @@ impl SshManager {
                 self.shell_sender = None;
             }
 
-            // 4. Send Keepalive / Heartbeat
-            if last_keepalive.elapsed() > keepalive_interval {
-                let _ = self.session.keepalive_send(); // Keep main session alive
-                let _ = self.pool.heartbeat_check(); // Check pool sessions
-                last_keepalive = Instant::now();
+            // 4. Perform Layered Heartbeat Check
+            let heartbeat_result = self.heartbeat_manager.perform_heartbeat(&self.session);
+
+            // 4.5 Perform Network Latency Check (if enabled and interval elapsed)
+            if self.network_monitor.should_check() {
+                if let Err(e) = self.network_monitor.measure_latency(&self.session) {
+                    eprintln!("[NetworkMonitor] Failed to measure latency: {}", e);
+                } else {
+                    let status = self.network_monitor.get_status();
+                    let params = self.network_monitor.get_recommended_params();
+                    eprintln!(
+                        "[NetworkMonitor] Latency: {}ms, Quality: {:?}, Recommended buffer: {}KB",
+                        status.latency_ms,
+                        status.quality,
+                        params.sftp_buffer_size / 1024
+                    );
+                }
             }
 
-            // 5. Sleep if idle
+            // 5. Handle Heartbeat Result
+            match heartbeat_result {
+                HeartbeatResult::Success => {
+                    // Connection is healthy, also check pool
+                    let _ = self.pool.heartbeat_check();
+                }
+                HeartbeatResult::Timeout => {
+                    // Log timeout but don't take action yet
+                    let status = self.heartbeat_manager.get_status();
+                    if status.consecutive_failures > 0 {
+                        eprintln!(
+                            "[Heartbeat] Timeout detected (failures: {})",
+                            status.consecutive_failures
+                        );
+                    }
+                }
+                HeartbeatResult::Failed(msg) => {
+                    eprintln!("[Heartbeat] Check failed: {}", msg);
+                }
+                HeartbeatResult::SessionDead => {
+                    eprintln!("[Heartbeat] Session appears dead");
+                }
+            }
+
+            // 6. Take Action Based on Heartbeat Status
+            let action = self.heartbeat_manager.get_recommended_action();
+            match action {
+                HeartbeatAction::None => {
+                    // All good
+                }
+                HeartbeatAction::SendKeepalive => {
+                    // Send immediate keepalive
+                    let _ = crate::ssh::utils::ssh2_retry(|| self.session.keepalive_send());
+                }
+                HeartbeatAction::ReconnectBackground => {
+                    eprintln!("[Heartbeat] Attempting background reconnection...");
+                    // Try to rebuild pool connections silently
+                    if let Err(e) = self.pool.rebuild_all() {
+                        eprintln!("[Heartbeat] Background reconnect failed: {}", e);
+                    } else {
+                        // Reset heartbeat status on successful reconnect
+                        self.heartbeat_manager.reset();
+                    }
+                }
+                HeartbeatAction::NotifyUser => {
+                    // In a real implementation, this would emit an event to the frontend
+                    eprintln!(
+                        "[Heartbeat] Connection unstable - user notification recommended"
+                    );
+                    // Still try to reconnect
+                    if let Err(e) = self.pool.rebuild_all() {
+                        eprintln!("[Heartbeat] Reconnect attempt failed: {}", e);
+                    }
+                }
+                HeartbeatAction::ForceReconnect => {
+                    eprintln!("[Heartbeat] Force reconnecting...");
+                    // Force rebuild all connections
+                    let _ = self.pool.rebuild_all();
+                    // Reset heartbeat status
+                    self.heartbeat_manager.reset();
+                }
+            }
+
+            // 7. Sleep if idle - use dynamic sleep based on heartbeat settings
             if !activity {
-                thread::sleep(Duration::from_millis(10));
+                let sleep_duration = self.heartbeat_manager.get_min_check_interval()
+                    .min(Duration::from_millis(100)); // Cap at 100ms for responsiveness
+                thread::sleep(sleep_duration);
             }
         }
 

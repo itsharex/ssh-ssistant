@@ -1,7 +1,7 @@
 // use super::connection::SessionSshPool; // Keep for now if referenced elsewhere, but we will remove usage
 use super::manager::{SshCommand, SshManager};
 use super::terminal::start_shell_thread;
-use crate::models::Connection as SshConnConfig;
+use crate::models::{Connection as SshConnConfig, ConnectionTimeoutSettings};
 use crate::ssh::{execute_ssh_operation, ShellMsg};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,7 +74,7 @@ pub async fn test_connection(app: AppHandle, config: SshConnConfig) -> Result<St
     }
 
     execute_ssh_operation(move || {
-        let session = super::connection::establish_connection_with_retry(&populated_config)?;
+        let session = super::connection::establish_connection_with_retry(&populated_config, None, None)?;
         // Disconnect immediately as we only wanted to test credentials/reachability
         let _ = session.session.disconnect(None, "Connection Test", None);
         Ok("Connection successful".to_string())
@@ -129,10 +129,17 @@ pub async fn connect(
         let config_clone = populated_config.clone();
         let shutdown_signal_clone = shutdown_signal.clone();
 
+        // Get timeout settings from app settings
+        let app_settings = crate::db::get_settings(app.clone()).ok();
+        let timeout_settings: Option<ConnectionTimeoutSettings> =
+            app_settings.as_ref().map(|s| s.connection_timeout.clone());
+        let reconnect_settings: Option<crate::models::ReconnectSettings> =
+            app_settings.as_ref().map(|s| s.reconnect.clone());
+
         // Establish connection and spawn manager thread
         let sender = tokio::task::spawn_blocking(move || {
-            let session = super::connection::establish_connection_with_retry(&config_clone)?;
-            let pool = super::connection::SessionSshPool::new(config_clone.clone(), 3)
+            let session = super::connection::establish_connection_with_retry(&config_clone, timeout_settings.as_ref(), reconnect_settings.as_ref())?;
+            let pool = super::connection::SessionSshPool::with_reconnect_settings(config_clone.clone(), 3, timeout_settings, reconnect_settings)
                 .map_err(|e| e.to_string())?;
 
             let (tx, rx) = std::sync::mpsc::channel();
