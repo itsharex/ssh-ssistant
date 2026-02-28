@@ -298,3 +298,99 @@ pub struct AdaptiveParams {
     pub command_timeout_secs: u32,
     pub keepalive_interval_secs: u32,
 }
+
+/// 文件操作错误类型（用于前端解析）
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum FileErrorType {
+    Network,
+    Permission,
+    NotFound,
+    Session,
+    Timeout,
+    Unknown,
+}
+
+/// 文件操作结构化错误响应
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FileOperationError {
+    /// 错误类型
+    pub error_type: FileErrorType,
+    /// 用户友好的错误消息
+    pub message: String,
+    /// 是否可重试
+    pub retryable: bool,
+    /// 原始错误信息（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_error: Option<String>,
+}
+
+impl FileOperationError {
+    /// 根据错误消息自动判断错误类型
+    pub fn from_message(msg: String) -> Self {
+        let msg_lower = msg.to_lowercase();
+        let (error_type, retryable) = if msg_lower.contains("permission denied")
+            || msg_lower.contains("access denied")
+            || msg_lower.contains("not authorized")
+        {
+            (FileErrorType::Permission, false)
+        } else if msg_lower.contains("not found")
+            || msg_lower.contains("no such file")
+            || msg_lower.contains("does not exist")
+        {
+            (FileErrorType::NotFound, false)
+        } else if msg_lower.contains("timeout")
+            || msg_lower.contains("timed out")
+        {
+            (FileErrorType::Timeout, true)
+        } else if msg_lower.contains("connection reset")
+            || msg_lower.contains("connection lost")
+            || msg_lower.contains("network")
+        {
+            (FileErrorType::Network, true)
+        } else if msg_lower.contains("session")
+            || msg_lower.contains("disconnected")
+        {
+            (FileErrorType::Session, true)
+        } else {
+            (FileErrorType::Unknown, false)
+        };
+
+        Self {
+            error_type,
+            message: msg.clone(),
+            retryable,
+            original_error: Some(msg),
+        }
+    }
+
+    /// 创建会话错误
+    pub fn session_not_found() -> Self {
+        Self {
+            error_type: FileErrorType::Session,
+            message: "Session not found or disconnected".to_string(),
+            retryable: false,
+            original_error: None,
+        }
+    }
+}
+
+impl From<String> for FileOperationError {
+    fn from(msg: String) -> Self {
+        Self::from_message(msg)
+    }
+}
+
+impl From<&str> for FileOperationError {
+    fn from(msg: &str) -> Self {
+        Self::from_message(msg.to_string())
+    }
+}
+
+impl std::fmt::Display for FileOperationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for FileOperationError {}

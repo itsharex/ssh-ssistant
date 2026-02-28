@@ -98,6 +98,8 @@
       "owner": "拥有者"
     },
     "emptyDirectory": "空目录",
+    "loadError": "加载目录失败",
+    "treeLoadError": "加载树状目录失败",
     "contextMenu": {
       "download": "下载",
       "batchDownload": "批量下载",

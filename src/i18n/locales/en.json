@@ -98,6 +98,8 @@
       "owner": "Owner"
     },
     "emptyDirectory": "Empty directory",
+    "loadError": "Failed to load directory",
+    "treeLoadError": "Failed to load tree directory",
     "contextMenu": {
       "download": "Download",
       "batchDownload": "Batch Download",

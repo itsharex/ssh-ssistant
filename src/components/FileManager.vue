@@ -14,6 +14,7 @@ import TransferList from './TransferList.vue';
 import VirtualFileList from './VirtualFileList.vue';
 import { useI18n } from '../composables/useI18n';
 import { getPathUtils } from '../composables/usePath';
+import { parseFileError, getErrorMessage } from '../composables/useFileError';
 // import draggable from 'vuedraggable'; // Removed
 
 type ColumnKey = 'name' | 'size' | 'date' | 'owner';
@@ -148,6 +149,11 @@ const unlistenDrop = ref<UnlistenFn | null>(null);
 // Path suggestions
 const suggestions = ref<string[]>([]);
 const showSuggestions = ref(false);
+
+// 防抖和取消机制
+let loadFilesAbortController: AbortController | null = null;
+let loadFilesDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+const isLoadingFiles = ref(false);
 const activeSuggestionIndex = ref(-1);
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -353,89 +359,123 @@ function onDragStart(event: DragEvent, element: FileEntry | TreeNode) {
 }
 
 async function loadFiles(path: string) {
-    try {
-        console.log('Loading files for path:', path);
-        const loadedFiles = await invoke<FileEntry[]>('list_files', { id: props.sessionId, path });
+    // 取消之前的防抖定时器
+    if (loadFilesDebounceTimer) {
+        clearTimeout(loadFilesDebounceTimer);
+        loadFilesDebounceTimer = null;
+    }
 
-        // Add parent directory entry ".." when not in root
-        const filesWithParent = path !== '.' ? [{
-            name: '..',
-            size: 0,
-            mtime: 0,
-            isDir: true,
-            permissions: 755,
-            uid: 0,
-            owner: '-'
-        }, ...loadedFiles] : loadedFiles;
+    // 防抖处理：100ms 内的重复调用将被合并
+    loadFilesDebounceTimer = setTimeout(async () => {
+        // 取消之前进行中的请求
+        if (loadFilesAbortController) {
+            loadFilesAbortController.abort();
+        }
 
-        files.value = filesWithParent;
-        triggerRef(files);
-        currentPath.value = path;
-        // Display actual path instead of "."
-        pathInput.value = path === '.' ? '/' : path;
-        console.log('Set currentPath to:', path, 'displayed as:', pathInput.value);
-        selectedFiles.value.clear();
-        lastSelectedIndex.value = -1;
+        loadFilesAbortController = new AbortController();
+        const currentController = loadFilesAbortController;
+        isLoadingFiles.value = true;
 
-        if (viewMode.value === 'tree') {
-            treeRootPath.value = path;
-            treeNodes.value = new Map();
-            childrenMap.value = new Map();
-            expandedPaths.value = new Set();
-            selectedTreePaths.value = new Set();
-            const parentPath = path === '.' ? null : path;
-            const newChildrenMap = new Map<string | null, string[]>();
-            const childPaths: string[] = [];
+        try {
+            console.log('Loading files for path:', path);
+            const loadedFiles = await invoke<FileEntry[]>('list_files', { id: props.sessionId, path });
+
+            // 检查请求是否已被取消
+            if (currentController.signal.aborted) {
+                return;
+            }
 
             // Add parent directory entry ".." when not in root
-            if (path !== '/' && path !== '.') {
-                const parentEntry: FileEntry = {
-                    name: '..',
-                    size: 0,
-                    mtime: 0,
-                    isDir: true,
-                    permissions: 755,
-                    uid: 0,
-                    owner: '-'
-                };
-                const parentDirPath = pathUtils.value.dirname(path);
-                treeNodes.value.set(parentDirPath, {
-                    entry: parentEntry,
-                    path: parentDirPath,
-                    depth: 0,
-                    parentPath,
-                    childrenLoaded: false,
-                    loading: false,
-                });
-                childPaths.push(parentDirPath);
+            const filesWithParent = path !== '.' ? [{
+                name: '..',
+                size: 0,
+                mtime: 0,
+                isDir: true,
+                permissions: 755,
+                uid: 0,
+                owner: '-'
+            }, ...loadedFiles] : loadedFiles;
+
+            files.value = filesWithParent;
+            triggerRef(files);
+            currentPath.value = path;
+            // Display actual path instead of "."
+            pathInput.value = path === '.' ? '/' : path;
+            console.log('Set currentPath to:', path, 'displayed as:', pathInput.value);
+            selectedFiles.value.clear();
+            lastSelectedIndex.value = -1;
+
+            if (viewMode.value === 'tree') {
+                treeRootPath.value = path;
+                treeNodes.value = new Map();
+                childrenMap.value = new Map();
+                expandedPaths.value = new Set();
+                selectedTreePaths.value = new Set();
+                const parentPath = path === '.' ? null : path;
+                const newChildrenMap = new Map<string | null, string[]>();
+                const childPaths: string[] = [];
+
+                // Add parent directory entry ".." when not in root
+                if (path !== '/' && path !== '.') {
+                    const parentEntry: FileEntry = {
+                        name: '..',
+                        size: 0,
+                        mtime: 0,
+                        isDir: true,
+                        permissions: 755,
+                        uid: 0,
+                        owner: '-'
+                    };
+                    const parentDirPath = pathUtils.value.dirname(path);
+                    treeNodes.value.set(parentDirPath, {
+                        entry: parentEntry,
+                        path: parentDirPath,
+                        depth: 0,
+                        parentPath,
+                        childrenLoaded: false,
+                        loading: false,
+                    });
+                    childPaths.push(parentDirPath);
+                }
+
+                for (const entry of files.value) {
+                    // Skip the ".." entry as it's already added above
+                    if (entry.name === '..') continue;
+
+                    const fullPath = pathUtils.value.join(path, entry.name);
+                    treeNodes.value.set(fullPath, {
+                        entry,
+                        path: fullPath,
+                        depth: 0,
+                        parentPath,
+                        childrenLoaded: false,
+                        loading: false,
+                    });
+                    childPaths.push(fullPath);
+                }
+
+                newChildrenMap.set(parentPath, childPaths);
+                childrenMap.value = newChildrenMap;
+                triggerRef(treeNodes);
+                triggerRef(childrenMap);
             }
-
-            for (const entry of files.value) {
-                // Skip the ".." entry as it's already added above
-                if (entry.name === '..') continue;
-
-                const fullPath = pathUtils.value.join(path, entry.name);
-                treeNodes.value.set(fullPath, {
-                    entry,
-                    path: fullPath,
-                    depth: 0,
-                    parentPath,
-                    childrenLoaded: false,
-                    loading: false,
-                });
-                childPaths.push(fullPath);
+        } catch (e) {
+            // 忽略取消错误
+            if (currentController.signal.aborted) {
+                return;
             }
-
-            newChildrenMap.set(parentPath, childPaths);
-            childrenMap.value = newChildrenMap;
-            triggerRef(treeNodes);
-            triggerRef(childrenMap);
+            console.error(e);
+            const fileError = parseFileError(e);
+            const errorMsg = getErrorMessage(fileError, t);
+            notificationStore.error(`${t('fileManager.loadError') || 'Failed to load directory'}: ${errorMsg}`);
+            files.value = [];
+            triggerRef(files);
+        } finally {
+            if (!currentController.signal.aborted) {
+                isLoadingFiles.value = false;
+            }
         }
-    } catch (e) {
-        console.error(e);
-        files.value = [];
-        triggerRef(files);
-    }
+    }, 100);
 }
 
 
@@ -497,6 +537,7 @@ async function toggleDirectory(node: TreeNode) {
         triggerRef(childrenMap);
     } catch (e) {
         console.error(e);
+        notificationStore.error(`${t('fileManager.treeLoadError') || 'Failed to load tree directory'}: ${getErrorMessage(parseFileError(e), t)}`);
     } finally {
         const updated = treeNodes.value.get(node.path);
         if (updated) {
@@ -647,6 +688,16 @@ onUnmounted(() => {
     window.removeEventListener('keydown', handleKeyDown);
     if (unlistenDrop.value) {
         unlistenDrop.value();
+    }
+    // 清理防抖定时器
+    if (loadFilesDebounceTimer) {
+        clearTimeout(loadFilesDebounceTimer);
+        loadFilesDebounceTimer = null;
+    }
+    // 取消进行中的请求
+    if (loadFilesAbortController) {
+        loadFilesAbortController.abort();
+        loadFilesAbortController = null;
     }
 });
 

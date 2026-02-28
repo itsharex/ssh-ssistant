@@ -177,46 +177,58 @@ impl SessionSshPool {
 
     /// 获取后台会话（智能分配：优先空闲，繁忙则动态补齐）
     pub fn get_background_session(&self) -> Result<Arc<Mutex<ManagedSession>>, String> {
-        let mut sessions = self.background_sessions.lock().map_err(|e| e.to_string())?;
+        // 使用默认超时 5 秒
+        self.get_background_session_with_timeout(Duration::from_secs(5))
+    }
 
-        // 1. 尝试寻找当前没有被其它线程锁定的”空闲”会话
-        for session in sessions.iter() {
-            if let Ok(_guard) = session.try_lock() {
-                // 能够立即拿到锁，说明它是空闲的
-                return Ok(session.clone());
+    /// 获取后台会话（带超时保护）
+    pub fn get_background_session_with_timeout(&self, timeout: Duration) -> Result<Arc<Mutex<ManagedSession>>, String> {
+        let start = Instant::now();
+        let check_interval = Duration::from_millis(50);
+
+        loop {
+            // 检查超时
+            if start.elapsed() > timeout {
+                return Err("Timeout waiting for available SFTP session. Please try again later.".to_string());
             }
+
+            let mut sessions = self.background_sessions.lock().map_err(|e| e.to_string())?;
+
+            // 1. 尝试寻找当前没有被其它线程锁定的"空闲"会话
+            for session in sessions.iter() {
+                if let Ok(_guard) = session.try_lock() {
+                    // 能够立即拿到锁，说明它是空闲的
+                    return Ok(session.clone());
+                }
+            }
+
+            // 2. 如果没有空闲会话，且还没达到上限，则创建一个新会话
+            if sessions.len() < self.max_background_sessions {
+                // 使用指数退避策略替代固定延迟
+                if !sessions.is_empty() {
+                    let mut count = self.connection_stagger_count.lock().map_err(|e| e.to_string())?;
+                    let delay_ms = 10_u64.saturating_pow((*count).min(5)); // 指数退避：10ms, 100ms, 1s, 10s
+                    *count = count.saturating_add(1);
+                    drop(count);
+                    thread::sleep(Duration::from_millis(delay_ms));
+                }
+
+                let new_session = establish_connection_with_retry(&self.config, self.timeout_settings.as_ref(), self.reconnect_settings.as_ref())?;
+                let session_arc = Arc::new(Mutex::new(new_session));
+                sessions.push(session_arc.clone());
+
+                // 重置计数器
+                if let Ok(mut count) = self.connection_stagger_count.lock() {
+                    *count = 0;
+                }
+
+                return Ok(session_arc);
+            }
+
+            // 3. 所有会话都在忙，释放锁后短暂等待再重试
+            drop(sessions);
+            thread::sleep(check_interval);
         }
-
-        // 2. 如果没有空闲会话，且还没达到上限，则创建一个新会话
-        if sessions.len() < self.max_background_sessions {
-            // 使用指数退避策略替代固定延迟
-            if !sessions.is_empty() {
-                let mut count = self.connection_stagger_count.lock().map_err(|e| e.to_string())?;
-                let delay_ms = 10_u64.saturating_pow((*count).min(5)); // 指数退避：10ms, 100ms, 1s, 10s
-                *count = count.saturating_add(1);
-                drop(count);
-                thread::sleep(Duration::from_millis(delay_ms));
-            }
-
-            let new_session = establish_connection_with_retry(&self.config, self.timeout_settings.as_ref(), self.reconnect_settings.as_ref())?;
-            let session_arc = Arc::new(Mutex::new(new_session));
-            sessions.push(session_arc.clone());
-
-            // 重置计数器
-            if let Ok(mut count) = self.connection_stagger_count.lock() {
-                *count = 0;
-            }
-
-            return Ok(session_arc);
-        }
-
-        // 3. 所有会话都在忙（被锁定），且已达上限，则退而求其次，轮询阻塞等待一个
-        let mut index = self.next_bg_index.lock().map_err(|e| e.to_string())?;
-        let session = sessions[*index % sessions.len()].clone();
-        *index = (*index + 1) % sessions.len();
-        drop(index);
-
-        Ok(session)
     }
 
     /// 检查并清理断开的连接

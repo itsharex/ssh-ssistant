@@ -2,6 +2,7 @@ import { defineStore } from 'pinia';
 import { ref } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { useNotificationStore } from './notifications';
 
 export type TransferStatus = 'pending' | 'running' | 'paused' | 'completed' | 'error' | 'cancelled';
 
@@ -83,16 +84,17 @@ export const useTransferStore = defineStore('transfers', () => {
     async function syncWithBackend() {
         try {
             const transfers = await invoke<any[]>('get_transfers');
-            // Merge transfers. Prioritize backend state.
-            // But keep pending items that are not in backend?
 
-            // const backendIds = new Set(transfers.map(t => t.id));
+            // 获取后端 ID 集合
+            const backendIds = new Set(transfers.map(t => t.id));
 
-            // Remove items that are NOT pending and NOT in backend (e.g. removed on backend)
-            // But maybe we want to keep history if backend doesn't store it forever? 
-            // For now, assume backend is truth for running/completed.
+            // 保留 pending 和本地临时状态的项（这些可能还未同步到后端）
+            const localOnlyItems = items.value.filter(i =>
+                i.status === 'pending' ||
+                (i.isTemp && !backendIds.has(i.id))
+            );
 
-            // Map backend transfer to TransferItem
+            // 映射后端数据
             const mappedItems: TransferItem[] = transfers.map(t => ({
                 id: t.id,
                 type: t.transfer_type as 'upload' | 'download',
@@ -105,17 +107,29 @@ export const useTransferStore = defineStore('transfers', () => {
                 status: t.status as TransferStatus,
                 error: t.error || undefined,
                 sessionId: t.session_id,
+                isDirectory: t.is_directory,
+                childFiles: t.child_files,
+                completedFiles: t.completed_files,
             }));
 
-            // Keep pending items from local state
-            const pendingItems = items.value.filter(i => i.status === 'pending');
+            // 合并：后端状态优先，但保留本地独有项
+            items.value = [...mappedItems, ...localOnlyItems];
 
-            // Merge
-            items.value = [...pendingItems, ...mappedItems];
+            // 清理 directoryProgress 中已完成的项
+            const validIds = new Set(items.value.map(i => i.id));
+            for (const id of directoryProgress.keys()) {
+                if (!validIds.has(id)) {
+                    directoryProgress.delete(id);
+                }
+            }
 
-            // Sort? Maybe created_at if we had it.
+            // 验证状态一致性
+            validateStateConsistency();
+
         } catch (e) {
             console.error("Failed to sync transfers:", e);
+            const notificationStore = useNotificationStore();
+            notificationStore.warning(`Transfer sync failed. Some transfers may not be visible.`);
         }
     }
 
@@ -207,6 +221,26 @@ export const useTransferStore = defineStore('transfers', () => {
                 item.status = 'completed';
                 item.progress = 100;
                 item.transferred = progress.totalSize;
+            }
+        }
+    }
+
+    // 状态一致性验证函数
+    function validateStateConsistency() {
+        // 检查 directoryProgress 和 items 的一致性
+        const directoryItems = items.value.filter(i => i.isDirectory);
+
+        for (const item of directoryItems) {
+            if (!directoryProgress.has(item.id) && item.status === 'running') {
+                // 重建丢失的进度跟踪
+                directoryProgress.set(item.id, {
+                    totalFiles: item.childFiles || 0,
+                    completedFiles: item.completedFiles || 0,
+                    totalSize: item.size,
+                    transferredSize: item.transferred,
+                    isPaused: false,
+                    pausedFiles: new Set()
+                });
             }
         }
     }

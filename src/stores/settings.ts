@@ -24,7 +24,7 @@ export const useSettingsStore = defineStore('settings', {
       sftpBufferSize: 512
     },
     sshPool: {
-      maxBackgroundSessions: 3,
+      maxBackgroundSessions: 6,
       enableAutoCleanup: true,
       cleanupIntervalMinutes: 5
     },

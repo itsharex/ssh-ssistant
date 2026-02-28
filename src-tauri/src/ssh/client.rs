@@ -135,11 +135,16 @@ pub async fn connect(
             app_settings.as_ref().map(|s| s.connection_timeout.clone());
         let reconnect_settings: Option<crate::models::ReconnectSettings> =
             app_settings.as_ref().map(|s| s.reconnect.clone());
+        // 从设置中获取最大后台会话数，默认为 6（比原来的 3 更大，减少阻塞）
+        let max_background_sessions: usize = app_settings
+            .as_ref()
+            .map(|s| s.ssh_pool.max_background_sessions as usize)
+            .unwrap_or(6);
 
         // Establish connection and spawn manager thread
         let sender = tokio::task::spawn_blocking(move || {
             let session = super::connection::establish_connection_with_retry(&config_clone, timeout_settings.as_ref(), reconnect_settings.as_ref())?;
-            let pool = super::connection::SessionSshPool::with_reconnect_settings(config_clone.clone(), 3, timeout_settings, reconnect_settings)
+            let pool = super::connection::SessionSshPool::with_reconnect_settings(config_clone.clone(), max_background_sessions, timeout_settings, reconnect_settings)
                 .map_err(|e| e.to_string())?;
 
             let (tx, rx) = std::sync::mpsc::channel();
