@@ -77,6 +77,7 @@ pub mod system;
 pub mod terminal;
 pub mod utils;
 pub mod wsl;
+pub mod transfer;
 
 // Re-export main types and functions for backward compatibility
 pub use client::AppState;
@@ -89,3 +90,11 @@ pub use manager::SshCommand;
 pub use network_monitor::NetworkMonitor;
 pub use reconnect::ReconnectManager;
 pub use utils::{execute_ssh_operation, ssh2_retry};
+
+// Re-export transfer module types
+pub use transfer::{
+    TransferManager, TransferOperation, TransferSettings, TransferError,
+    TransferEvent, TransferHealth, TransferStatus,
+    TransferState, TransferStateHandle, TransferCheckpoint, CheckpointManager,
+    PoolStats, TransferConnection, TransferPool, AsyncSftp,
+};

@@ -37,6 +37,9 @@ pub struct AppState {
     pub clients: Mutex<HashMap<String, SshClient>>,
     pub transfers: Mutex<HashMap<String, Arc<TransferState>>>, // ID -> TransferState
     pub command_cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>, // Command ID -> CancelFlag
+    // Note: TransferManager is integrated but not stored in AppState
+    // Each transfer operation can optionally use the new TransferManager
+    // For backward compatibility, we maintain the existing transfer structure
 }
 
 impl AppState {

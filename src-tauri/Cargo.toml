@@ -54,3 +54,5 @@ windows = { version = "0.60", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 portable-pty = "0.8"
+thiserror = "2.0"
+tempfile = "3.14"

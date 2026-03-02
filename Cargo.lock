@@ -119,6 +119,8 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-fs",
  "tauri-plugin-opener",
+ "tempfile",
+ "thiserror 2.0.17",
  "tokio",
  "uuid",
  "windows 0.60.0",

@@ -8,7 +8,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -117,7 +117,8 @@ pub struct SshManager {
     heartbeat_manager: HeartbeatManager,
 
     // Network Monitor
-    network_monitor: NetworkMonitor,
+    network_monitor: Arc<Mutex<NetworkMonitor>>,
+    latency_tx: Option<Sender<()>>,
 }
 
 impl SshManager {
@@ -147,7 +148,60 @@ impl SshManager {
             heartbeat_settings,
             shutdown_signal.clone(),
         );
-        let network_monitor = NetworkMonitor::with_default_settings();
+        let network_monitor = Arc::new(Mutex::new(NetworkMonitor::with_default_settings()));
+
+        let (latency_tx, latency_rx) = std::sync::mpsc::channel();
+        let pool_clone = pool.clone();
+        let monitor_clone = Arc::clone(&network_monitor);
+
+        thread::spawn(move || {
+            loop {
+                if latency_rx.recv().is_err() {
+                    break;
+                }
+
+                let should_check = {
+                    if let Ok(monitor) = monitor_clone.lock() {
+                        monitor.should_check()
+                    } else {
+                        false
+                    }
+                };
+
+                if !should_check {
+                    continue;
+                }
+
+                let session_mutex = match pool_clone.get_background_session() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[NetworkMonitor] Failed to get background session: {}", e);
+                        continue;
+                    }
+                };
+
+                let session_guard = match session_mutex.lock() {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                if let Ok(mut monitor) = monitor_clone.lock() {
+                    if let Err(e) = monitor.measure_latency(&session_guard.session) {
+                        eprintln!("[NetworkMonitor] Failed to measure latency (worker): {}", e);
+                    } else {
+                        let status = monitor.get_status();
+                        let params = monitor.get_recommended_params();
+                        eprintln!(
+                            "[NetworkMonitor] Latency: {}ms, Quality: {:?}, Recommended buffer: {}KB",
+                            status.latency_ms,
+                            status.quality,
+                            params.sftp_buffer_size / 1024
+                        );
+                    }
+                }
+            }
+        });
+
         Self {
             session,
             pool,
@@ -157,6 +211,7 @@ impl SshManager {
             shell_sender: None,
             heartbeat_manager,
             network_monitor,
+            latency_tx: Some(latency_tx),
         }
     }
 
@@ -167,17 +222,20 @@ impl SshManager {
 
     /// Update network adaptive settings at runtime
     pub fn update_network_adaptive_settings(&mut self, settings: NetworkAdaptiveSettings) {
-        self.network_monitor.update_settings(settings);
+        if let Ok(mut monitor) = self.network_monitor.lock() {
+            monitor.update_settings(settings);
+        }
     }
 
     /// Get current network status
-    pub fn get_network_status(&self) -> &crate::models::NetworkStatus {
-        self.network_monitor.get_status()
+    pub fn get_network_status(&self) -> crate::models::NetworkStatus {
+        // Note: Return a cloned status to avoid lifetime issues
+        self.network_monitor.lock().unwrap().get_status().clone()
     }
 
     /// Get recommended adaptive parameters
     pub fn get_adaptive_params(&self) -> crate::models::AdaptiveParams {
-        self.network_monitor.get_recommended_params()
+        self.network_monitor.lock().unwrap().get_recommended_params()
     }
 
     pub fn run(&mut self) {
@@ -248,20 +306,9 @@ impl SshManager {
             // 4. Perform Layered Heartbeat Check
             let heartbeat_result = self.heartbeat_manager.perform_heartbeat(&self.session);
 
-            // 4.5 Perform Network Latency Check (if enabled and interval elapsed)
-            if self.network_monitor.should_check() {
-                if let Err(e) = self.network_monitor.measure_latency(&self.session) {
-                    eprintln!("[NetworkMonitor] Failed to measure latency: {}", e);
-                } else {
-                    let status = self.network_monitor.get_status();
-                    let params = self.network_monitor.get_recommended_params();
-                    eprintln!(
-                        "[NetworkMonitor] Latency: {}ms, Quality: {:?}, Recommended buffer: {}KB",
-                        status.latency_ms,
-                        status.quality,
-                        params.sftp_buffer_size / 1024
-                    );
-                }
+            // 4.5 Trigger Network Latency Check asynchronously (worker thread)
+            if let Some(tx) = &self.latency_tx {
+                let _ = tx.send(());
             }
 
             // 5. Handle Heartbeat Result
@@ -798,6 +845,10 @@ impl SshManager {
         use crate::ssh::ProgressPayload;
         use tauri::Emitter;
 
+        // Timeout configuration (default 5 minutes)
+        let sftp_timeout = Duration::from_secs(300); // 5 minutes default
+        let no_progress_timeout = Duration::from_secs(30); // 30 seconds without progress
+
         let session_mutex = pool.get_background_session()?;
         let session = session_mutex.lock().map_err(|e| e.to_string())?;
         let sftp = Self::bg_get_sftp(&session)?;
@@ -815,14 +866,35 @@ impl SshManager {
         let mut transferred = 0u64;
         let mut last_emit = Instant::now();
 
+        // Timeout tracking
+        let transfer_start = Instant::now();
+        let mut last_progress_time = Instant::now();
+        let mut would_block_count = 0u32;
+
         loop {
             if cancel_flag.load(Ordering::Relaxed) {
                 return Err("Cancelled".to_string());
             }
 
+            // Check overall timeout
+            if transfer_start.elapsed() > sftp_timeout {
+                return Err(format!(
+                    "Download timeout after {}s",
+                    sftp_timeout.as_secs()
+                ));
+            }
+
+            // Check no-progress timeout
+            if last_progress_time.elapsed() > no_progress_timeout {
+                return Err(format!(
+                    "No progress for {}s, connection may be dead",
+                    no_progress_timeout.as_secs()
+                ));
+            }
+
             // 获取锁，读取一小块数据，然后立即释放锁
             let read_res = {
-                let session = session_mutex.lock().map_err(|e| e.to_string())?;
+                let _session = session_mutex.lock().map_err(|e| e.to_string())?;
                 remote.read(&mut buf)
             };
 
@@ -831,6 +903,8 @@ impl SshManager {
                 Ok(n) => {
                     local.write_all(&buf[..n]).map_err(|e| e.to_string())?;
                     transferred += n as u64;
+                    last_progress_time = Instant::now(); // Update progress time
+                    would_block_count = 0; // Reset WouldBlock counter on success
 
                     if last_emit.elapsed().as_millis() > 100 {
                         let _ = app.emit(
@@ -845,6 +919,13 @@ impl SshManager {
                     }
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    would_block_count += 1;
+                    if would_block_count > 100 {
+                        return Err(format!(
+                            "Too many WouldBlock errors ({}), connection may be dead",
+                            would_block_count
+                        ));
+                    }
                     thread::sleep(Duration::from_millis(5));
                 }
                 Err(e) => return Err(e.to_string()),
@@ -873,6 +954,10 @@ impl SshManager {
         use crate::ssh::ProgressPayload;
         use tauri::Emitter;
 
+        // Timeout configuration (default 5 minutes)
+        let sftp_timeout = Duration::from_secs(300); // 5 minutes default
+        let no_progress_timeout = Duration::from_secs(30); // 30 seconds without progress
+
         let session_mutex = pool.get_background_session()?;
         let session = session_mutex.lock().map_err(|e| e.to_string())?;
         let sftp = Self::bg_get_sftp(&session)?;
@@ -896,9 +981,30 @@ impl SshManager {
         let mut transferred = 0u64;
         let mut last_emit = Instant::now();
 
+        // Timeout tracking
+        let transfer_start = Instant::now();
+        let mut last_progress_time = Instant::now();
+        let mut would_block_count = 0u32;
+
         loop {
             if cancel_flag.load(Ordering::Relaxed) {
                 return Err("Cancelled".to_string());
+            }
+
+            // Check overall timeout
+            if transfer_start.elapsed() > sftp_timeout {
+                return Err(format!(
+                    "Upload timeout after {}s",
+                    sftp_timeout.as_secs()
+                ));
+            }
+
+            // Check no-progress timeout
+            if last_progress_time.elapsed() > no_progress_timeout {
+                return Err(format!(
+                    "No progress for {}s, connection may be dead",
+                    no_progress_timeout.as_secs()
+                ));
             }
 
             let n = local.read(&mut buf).map_err(|e| e.to_string())?;
@@ -910,7 +1016,7 @@ impl SshManager {
             while pos < n {
                 // 获取锁，写入一部分数据，然后释放
                 let write_res = {
-                    let session = session_mutex.lock().map_err(|e| e.to_string())?;
+                    let _session = session_mutex.lock().map_err(|e| e.to_string())?;
                     remote.write(&buf[pos..n])
                 };
 
@@ -918,6 +1024,8 @@ impl SshManager {
                     Ok(written) => {
                         pos += written;
                         transferred += written as u64;
+                        last_progress_time = Instant::now(); // Update progress time
+                        would_block_count = 0; // Reset WouldBlock counter on success
 
                         if last_emit.elapsed().as_millis() > 100 {
                             let _ = app.emit(
@@ -932,6 +1040,13 @@ impl SshManager {
                         }
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        would_block_count += 1;
+                        if would_block_count > 100 {
+                            return Err(format!(
+                                "Too many WouldBlock errors ({}), connection may be dead",
+                                would_block_count
+                            ));
+                        }
                         thread::sleep(Duration::from_millis(5));
                     }
                     Err(e) => return Err(e.to_string()),

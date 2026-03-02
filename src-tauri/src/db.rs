@@ -241,6 +241,41 @@ pub fn init_db(app_handle: &AppHandle) -> Result<()> {
         [],
     );
 
+    // --- Transfer Records Support ---
+
+    // Create transfer_records table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS transfer_records (
+            id TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            local_path TEXT NOT NULL,
+            remote_path TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            transferred INTEGER DEFAULT 0,
+            status TEXT NOT NULL,
+            error_msg TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            completed_at INTEGER
+        )",
+        [],
+    )?;
+
+    // Create index for faster queries
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transfer_records_client_id ON transfer_records(client_id)",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transfer_records_status ON transfer_records(status)",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transfer_records_created_at ON transfer_records(created_at)",
+        [],
+    );
+
     Ok(())
 }
 
@@ -639,4 +674,157 @@ pub fn generate_ssh_key(
         id: Some(id),
         ..key
     })
+}
+
+// --- Transfer Record Functions ---
+
+/// Save or update a transfer record
+pub fn save_transfer_record(app_handle: &AppHandle, transfer: &TransferRecord) -> Result<(), String> {
+    let db_path = get_db_path(app_handle);
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "INSERT OR REPLACE INTO transfer_records
+        (id, client_id, operation, local_path, remote_path, file_size, transferred, status, error_msg, created_at, updated_at, completed_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            transfer.id,
+            transfer.client_id,
+            transfer.operation,
+            transfer.local_path,
+            transfer.remote_path,
+            transfer.file_size,
+            transfer.transferred,
+            transfer.status,
+            transfer.error_msg,
+            transfer.created_at,
+            transfer.updated_at,
+            transfer.completed_at,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Get transfer records by client ID
+pub fn get_transfer_records_by_client(app_handle: &AppHandle, client_id: &str) -> Result<Vec<TransferRecord>, String> {
+    let db_path = get_db_path(app_handle);
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+
+    let mut stmt = conn.prepare(
+        "SELECT id, client_id, operation, local_path, remote_path, file_size, transferred, status, error_msg, created_at, updated_at, completed_at
+        FROM transfer_records
+        WHERE client_id = ?1
+        ORDER BY created_at DESC"
+    ).map_err(|e| e.to_string())?;
+
+    let rows = stmt
+        .query_map(params![client_id], |row| {
+            Ok(TransferRecord {
+                id: row.get(0)?,
+                client_id: row.get(1)?,
+                operation: row.get(2)?,
+                local_path: row.get(3)?,
+                remote_path: row.get(4)?,
+                file_size: row.get(5)?,
+                transferred: row.get(6)?,
+                status: row.get(7)?,
+                error_msg: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+                completed_at: row.get(11)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(records)
+}
+
+/// Get transfer record by ID
+pub fn get_transfer_record(app_handle: &AppHandle, transfer_id: &str) -> Result<Option<TransferRecord>, String> {
+    let db_path = get_db_path(app_handle);
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+
+    let mut stmt = conn.prepare(
+        "SELECT id, client_id, operation, local_path, remote_path, file_size, transferred, status, error_msg, created_at, updated_at, completed_at
+        FROM transfer_records
+        WHERE id = ?1"
+    ).map_err(|e| e.to_string())?;
+
+    let mut rows = stmt
+        .query_map(params![transfer_id], |row| {
+            Ok(TransferRecord {
+                id: row.get(0)?,
+                client_id: row.get(1)?,
+                operation: row.get(2)?,
+                local_path: row.get(3)?,
+                remote_path: row.get(4)?,
+                file_size: row.get(5)?,
+                transferred: row.get(6)?,
+                status: row.get(7)?,
+                error_msg: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+                completed_at: row.get(11)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    if let Some(row) = rows.next() {
+        Ok(Some(row.map_err(|e| e.to_string())?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Delete transfer record by ID
+pub fn delete_transfer_record(app_handle: &AppHandle, transfer_id: &str) -> Result<(), String> {
+    let db_path = get_db_path(app_handle);
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+
+    conn.execute("DELETE FROM transfer_records WHERE id = ?1", params![transfer_id])
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Clean up old transfer records
+pub fn cleanup_old_transfer_records(app_handle: &AppHandle, days_old: i64) -> Result<usize, String> {
+    let db_path = get_db_path(app_handle);
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+
+    let cutoff = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64 - (days_old * 86400);
+
+    let affected = conn.execute(
+        "DELETE FROM transfer_records WHERE created_at < ?1 AND status IN ('completed', 'cancelled', 'failed')",
+        params![cutoff],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(affected)
+}
+
+// Transfer record model
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TransferRecord {
+    pub id: String,
+    pub client_id: String,
+    pub operation: String,
+    pub local_path: String,
+    pub remote_path: String,
+    pub file_size: i64,
+    pub transferred: i64,
+    pub status: String,
+    pub error_msg: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub completed_at: Option<i64>,
 }
