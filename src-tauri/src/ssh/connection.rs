@@ -205,20 +205,23 @@ impl SessionSshPool {
             // 2. 如果没有空闲会话，且还没达到上限，则创建一个新会话
             if sessions.len() < self.max_background_sessions {
                 // 使用指数退避策略替代固定延迟
-                if !sessions.is_empty() {
+                let delay_ms = if !sessions.is_empty() {
                     let mut count = self.connection_stagger_count.lock().map_err(|e| e.to_string())?;
                     let delay_ms = 10_u64.saturating_pow((*count).min(5)); // 指数退避：10ms, 100ms, 1s, 10s
                     *count = count.saturating_add(1);
-                    drop(count);
-                    // 释放锁后再 sleep，避免阻塞其他线程
-                    drop(sessions);
-                    thread::sleep(Duration::from_millis(delay_ms));
-                    continue; // 重新进入循环获取锁
-                }
+                    Some(delay_ms)
+                } else {
+                    None
+                };
 
                 // 关键修复：先释放锁，再建立新连接
                 // 这样其他线程可以继续使用现有的空闲会话
                 drop(sessions);
+
+                // Stagger new connections to avoid flooding the server
+                if let Some(ms) = delay_ms {
+                    thread::sleep(Duration::from_millis(ms));
+                }
 
                 // 建立新连接（可能需要较长时间，因为有重试机制）
                 let new_session = establish_connection_with_retry(&self.config, self.timeout_settings.as_ref(), self.reconnect_settings.as_ref())?;

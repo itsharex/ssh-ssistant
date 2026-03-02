@@ -256,7 +256,7 @@ impl std::fmt::Display for TransferEvent {
 }
 
 /// Transfer error types with retry information
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error, serde::Serialize, serde::Deserialize)]
 pub enum TransferError {
     // Retryable errors
     #[error("Temporary network error: {0}")]
@@ -374,7 +374,7 @@ impl From<String> for TransferError {
 pub type ProgressCallback = Box<dyn Fn(u64, u64) + Send + Sync>;
 
 /// Health status of the transfer system
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferHealth {
     pub active_transfers: usize,

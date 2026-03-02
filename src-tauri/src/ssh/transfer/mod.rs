@@ -42,7 +42,10 @@
 pub mod async_sftp;
 pub mod checkpoint;
 pub mod manager;
+pub mod observability;
 pub mod pool;
+pub mod prompt;
+pub mod retry;
 pub mod state;
 pub mod types;
 
