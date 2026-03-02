@@ -171,10 +171,10 @@ impl SshManager {
                     continue;
                 }
 
-                let session_mutex = match pool_clone.get_background_session() {
+                let session_mutex = match pool_clone.get_transfer_session() {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("[NetworkMonitor] Failed to get background session: {}", e);
+                        eprintln!("[NetworkMonitor] Failed to get transfer session: {}", e);
                         continue;
                     }
                 };
